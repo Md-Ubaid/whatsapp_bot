@@ -4,15 +4,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+_raw_url = os.getenv("DATABASE_URL", "")
 
-# Fix URL prefix if needed
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# Normalize postgres:// → postgresql:// (required by asyncpg)
+if _raw_url.startswith("postgres://"):
+    _raw_url = _raw_url.replace("postgres://", "postgresql://", 1)
 
-# Pass ssl=True directly in the URL instead of ssl_context object
-# This is more compatible with Python 3.14 + asyncpg
-if DATABASE_URL and "sslmode" not in DATABASE_URL:
-    DATABASE_URL += "?sslmode=require"
+# Enforce SSL for Neon (and most managed Postgres providers)
+if _raw_url and "sslmode" not in _raw_url:
+    _raw_url += "?sslmode=require"
 
-database = Database(DATABASE_URL)
+DATABASE_URL = _raw_url
+
+# Connection pool limits prevent exhausting Neon's free-tier connection cap
+# (typically 5–10 connections). Without limits, under load the pool grows
+# unboundedly until the DB refuses new connections.
+database = Database(DATABASE_URL, min_size=1, max_size=5)

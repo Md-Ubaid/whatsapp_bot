@@ -2,7 +2,6 @@ from whatsapp import (
     send_text_message,
     send_interactive_buttons,
     send_list_message,
-    send_image_message,
 )
 from db_helpers import (
     get_user_by_phone,
@@ -17,26 +16,12 @@ from db_helpers import (
     update_account_outstanding,
     get_account_by_id,
     database,
+    # Single source of truth — no longer duplicated in this file
+    PAYMENT_METHOD_LABELS,
 )
 from config import DASHBOARD_URL
 from datetime import datetime, date, timedelta
-
-
-# ── Payment method display labels ─────────────────────────────────────────────
-PAYMENT_METHOD_LABELS = {
-    "upi":           "UPI",
-    "debit_card":    "Debit Card",
-    "neft":          "NEFT",
-    "imps":          "IMPS",
-    "rtgs":          "RTGS",
-    "cheque":        "Cheque",
-    "auto_debit":    "Auto Debit",
-    "bank_transfer": "Bank Transfer",
-    "credit_card":   "Credit Card",
-    "wallet":        "Wallet",
-    "cash":          "Cash",
-    "prepaid_card":  "Prepaid Card",
-}
+import asyncio
 
 
 # ── Ordinal helper ─────────────────────────────────────────────────────────────
@@ -50,7 +35,6 @@ def ordinal(n: int) -> str:
 
 # ── Due-date label helper ──────────────────────────────────────────────────────
 def due_label(billing_day: int, today: date) -> str:
-    """Returns a short human label: 'Due TODAY', 'Due Tomorrow', 'Due in 3d', 'Overdue by 2d'."""
     import calendar
     try:
         due = today.replace(day=billing_day)
@@ -69,11 +53,41 @@ def due_label(billing_day: int, today: date) -> str:
         return f"🔴 Overdue {abs(delta)}d ({ordinal(billing_day)})"
 
 
+# ── Session helpers ────────────────────────────────────────────────────────────
+
+def _get_parsed(session) -> dict:
+    """
+    Safely extracts parsed_result from a session dict.
+    Returns {} if session is None, expired, or has no parsed_result.
+    Eliminates the repeated `dict(session["parsed_result"]) if session else {}`
+    pattern that caused crashes when sessions expired mid-flow.
+    """
+    if not session:
+        return {}
+    result = session.get("parsed_result", {})
+    return dict(result) if result else {}
+
+
+def _session_has(session, *fields) -> bool:
+    """
+    Returns True only if session exists AND all specified fields are
+    present and non-falsy in parsed_result.
+    Used to guard confirm handlers against expired sessions.
+    """
+    parsed = _get_parsed(session)
+    return all(parsed.get(f) for f in fields)
+
+
+async def _expired_session_reply(to: str):
+    """Standard reply when a confirm button is tapped with an expired session."""
+    await send_text_message(
+        to=to,
+        text="⏱️ Your session expired. Please start again."
+    )
+    await send_main_menu(to)
+
+
 async def get_due_subscriptions(user_id: int) -> list:
-    """
-    Returns active subscriptions that are overdue or due within the next 5 days,
-    excluding any already marked as paid this calendar month.
-    """
     today      = date.today()
     month_str  = today.strftime("%Y-%m")
     cutoff_day = today.day + 5
@@ -101,7 +115,6 @@ async def get_due_subscriptions(user_id: int) -> list:
     result = []
     for s in subs:
         bd = s["billing_day"]
-        # Include if overdue (bd <= today.day) OR coming up within 5 days
         if bd <= cutoff_day and s["id"] not in paid_ids:
             result.append(dict(s))
 
@@ -130,10 +143,6 @@ async def send_not_registered(to: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def send_main_menu(to: str):
-    """
-    Shows balance snapshot + due subscription alerts in the greeting,
-    then 3 clean top-level menu buttons: Transactions · Subscriptions · Reports.
-    """
     user = await get_user_by_phone(to)
     if not user:
         await send_not_registered(to)
@@ -142,7 +151,6 @@ async def send_main_menu(to: str):
     cache = await get_analytics_cache(user["id"])
     name  = user["name"] or "there"
 
-    # ── Balance line ──────────────────────────────────────────────────────────
     if cache:
         balance  = float(cache["default_balance"] or 0)
         snapshot = (
@@ -152,7 +160,6 @@ async def send_main_menu(to: str):
     else:
         snapshot = "📊 No data yet — log your first transaction!"
 
-    # ── Due subscription alerts ───────────────────────────────────────────────
     today    = date.today()
     due_subs = await get_due_subscriptions(user["id"])
 
@@ -296,7 +303,11 @@ async def handle_button_click(to: str, button_id: str, session):
         await send_subscription_picker(to)
 
     elif button_id == "sub_pay_confirm":
-        parsed = dict(session["parsed_result"]) if session else {}
+        # Guard: session must have sub_id, amount, account_id
+        if not _session_has(session, "sub_id", "amount"):
+            await _expired_session_reply(to)
+            return
+        parsed = _get_parsed(session)
         await confirm_subscription_payment(to, parsed)
 
     elif button_id == "sub_pay_cancel":
@@ -316,7 +327,11 @@ async def handle_button_click(to: str, button_id: str, session):
         )
 
     elif button_id == "sub_confirm":
-        parsed = dict(session["parsed_result"]) if session else {}
+        # Guard: session must have service_name, amount, billing_day
+        if not _session_has(session, "service_name", "amount", "billing_day"):
+            await _expired_session_reply(to)
+            return
+        parsed = _get_parsed(session)
         await confirm_subscription(to, parsed)
 
     elif button_id == "sub_cancel":
@@ -327,12 +342,19 @@ async def handle_button_click(to: str, button_id: str, session):
     # ── Expense flow ──────────────────────────────────────────────────────────
 
     elif button_id == "exp_skip_merchant":
-        parsed = dict(session["parsed_result"]) if session else {}
+        if not _session_has(session, "amount"):
+            await _expired_session_reply(to)
+            return
+        parsed = _get_parsed(session)
         parsed["merchant"] = None
         await show_expense_confirmation(to, parsed)
 
     elif button_id == "exp_confirm":
-        parsed = dict(session["parsed_result"]) if session else {}
+        # Guard: session must have amount and category at minimum
+        if not _session_has(session, "amount", "category"):
+            await _expired_session_reply(to)
+            return
+        parsed = _get_parsed(session)
         await confirm_expense(to, parsed)
 
     elif button_id == "exp_cancel":
@@ -343,7 +365,11 @@ async def handle_button_click(to: str, button_id: str, session):
     # ── Income flow ───────────────────────────────────────────────────────────
 
     elif button_id == "inc_confirm":
-        parsed = dict(session["parsed_result"]) if session else {}
+        # Guard: session must have amount and income_type
+        if not _session_has(session, "amount", "income_type"):
+            await _expired_session_reply(to)
+            return
+        parsed = _get_parsed(session)
         await confirm_income(to, parsed)
 
     elif button_id == "inc_cancel":
@@ -355,8 +381,6 @@ async def handle_button_click(to: str, button_id: str, session):
 
     elif button_id == "nav_home":
         await send_main_menu(to)
-
-    # ── Fallback ──────────────────────────────────────────────────────────────
 
     else:
         await send_main_menu(to)
@@ -390,7 +414,10 @@ async def handle_list_selection(to: str, row_id: str, session):
         )
 
     elif row_id.startswith("cat_") and status == "expense_category":
-        parsed = dict(session["parsed_result"])
+        if not session:
+            await _expired_session_reply(to)
+            return
+        parsed = _get_parsed(session)
         cat_map = {
             "cat_food_dining":   "Food & Dining",
             "cat_transport":     "Transport",
@@ -409,7 +436,10 @@ async def handle_list_selection(to: str, row_id: str, session):
         await send_subcategory_menu(to, parsed["category"])
 
     elif row_id.startswith("sub_cat_") and status == "expense_subcategory":
-        parsed = dict(session["parsed_result"])
+        if not session:
+            await _expired_session_reply(to)
+            return
+        parsed = _get_parsed(session)
         parsed["sub_category"] = (
             row_id.replace("sub_cat_", "").replace("_", " ").title()
         )
@@ -417,25 +447,37 @@ async def handle_list_selection(to: str, row_id: str, session):
         await send_account_picker(to, "💳 Paid from which account?")
 
     elif row_id.startswith("acc_") and status == "expense_account":
-        parsed = dict(session["parsed_result"])
+        if not session:
+            await _expired_session_reply(to)
+            return
+        parsed = _get_parsed(session)
         parsed["account_id"] = int(row_id.replace("acc_", ""))
         await set_session(to, "expense_account", parsed)
         await send_payment_method_or_skip(to, parsed)
 
     elif row_id.startswith("pm_") and status == "expense_payment_method":
-        parsed = dict(session["parsed_result"])
+        if not session:
+            await _expired_session_reply(to)
+            return
+        parsed = _get_parsed(session)
         parsed["payment_method"] = row_id.replace("pm_", "")
         await set_session(to, "expense_merchant", parsed)
         await send_merchant_step(to)
 
     elif row_id.startswith("acc_") and status == "income_account":
-        parsed = dict(session["parsed_result"])
+        if not session:
+            await _expired_session_reply(to)
+            return
+        parsed = _get_parsed(session)
         parsed["account_id"] = int(row_id.replace("acc_", ""))
         await set_session(to, "income_confirm", parsed)
         await show_income_confirmation(to, parsed)
 
     elif row_id.startswith("acc_") and status == "sub_add_account":
-        parsed = dict(session["parsed_result"])
+        if not session:
+            await _expired_session_reply(to)
+            return
+        parsed = _get_parsed(session)
         parsed["account_id"] = int(row_id.replace("acc_", ""))
         await set_session(to, "sub_add_confirm", parsed)
         await show_subscription_confirmation(to, parsed)
@@ -508,7 +550,7 @@ async def handle_text_message(to: str, text: str, session):
             amount = float(text.replace(",", "").replace("₹", "").strip())
             if amount <= 0:
                 raise ValueError
-            parsed = dict(session["parsed_result"])
+            parsed = _get_parsed(session)
             parsed["amount"] = amount
             await set_session(to, "income_account", parsed)
             await send_account_picker(to, "🏦 Which account received this income?")
@@ -516,7 +558,7 @@ async def handle_text_message(to: str, text: str, session):
             await send_text_message(to=to, text="⚠️ Please enter a valid amount.\nE.g. *92000*")
 
     elif status == "expense_merchant":
-        parsed = dict(session["parsed_result"])
+        parsed = _get_parsed(session)
         parsed["merchant"] = text.strip()
         await show_expense_confirmation(to, parsed)
 
@@ -533,7 +575,7 @@ async def handle_text_message(to: str, text: str, session):
             amount = float(text.replace(",", "").replace("₹", "").strip())
             if amount <= 0:
                 raise ValueError
-            parsed = dict(session["parsed_result"])
+            parsed = _get_parsed(session)
             parsed["amount"] = amount
             await set_session(to, "sub_add_day", parsed)
             await send_text_message(
@@ -552,7 +594,7 @@ async def handle_text_message(to: str, text: str, session):
             day = int(text.strip())
             if not 1 <= day <= 31:
                 raise ValueError
-            parsed = dict(session["parsed_result"])
+            parsed = _get_parsed(session)
             parsed["billing_day"] = day
             await set_session(to, "sub_add_account", parsed)
             await send_account_picker(to, "💳 Charged to which account?")
@@ -738,9 +780,9 @@ async def show_expense_confirmation(to: str, parsed: dict):
         if acc_row:
             acc_name = acc_row["nickname"]
             if acc_row["account_type"] == "credit_card":
-                limit     = float(acc_row["credit_limit"] or 0)
+                limit       = float(acc_row["credit_limit"] or 0)
                 outstanding = float(acc_row["outstanding"] or 0)
-                available = limit - outstanding
+                available   = limit - outstanding
                 if limit > 0 and amount > available:
                     warning_line = f"\n⚠️ *Over limit!* Available: ₹{available:,.0f}\n"
             else:
@@ -801,7 +843,8 @@ async def confirm_expense(to: str, parsed: dict):
             else:
                 await update_account_balance(account_id, float(acc["balance"] or 0) - amount)
 
-    await refresh_analytics_cache(user["id"])
+    # Run cache refresh in background — no need to block the reply
+    asyncio.create_task(refresh_analytics_cache(user["id"]))
     await reset_session(to)
 
     acc_name = f"Account ID {parsed.get('account_id', '')}"
@@ -887,7 +930,7 @@ async def confirm_income(to: str, parsed: dict):
         if acc:
             await update_account_balance(account_id, float(acc["balance"] or 0) + amount)
 
-    await refresh_analytics_cache(user["id"])
+    asyncio.create_task(refresh_analytics_cache(user["id"]))
     await reset_session(to)
 
     acc_name = f"Account ID {parsed.get('account_id', '')}"
@@ -1221,7 +1264,6 @@ async def send_subscriptions_list(to: str):
         )
         return
 
-    # Mark paid-this-month subscriptions with ✅
     month_str = today.strftime("%Y-%m")
     paid_rows = await database.fetch_all(
         """SELECT DISTINCT subscription_id FROM transactions
@@ -1263,7 +1305,6 @@ async def send_subscriptions_list(to: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def send_subscription_picker(to: str):
-    """Shows only unpaid subscriptions as a list to pick from."""
     from db_helpers import get_subscriptions
 
     user = await get_user_by_phone(to)
@@ -1314,7 +1355,6 @@ async def send_subscription_picker(to: str):
 
 
 async def confirm_subscription_payment(to: str, parsed: dict):
-    """Log subscription as an expense, update account balance, refresh cache."""
     user = await get_user_by_phone(to)
     if not user:
         await send_not_registered(to)
@@ -1345,7 +1385,7 @@ async def confirm_subscription_payment(to: str, parsed: dict):
             else:
                 await update_account_balance(account_id, float(acc["balance"] or 0) - amount)
 
-    await refresh_analytics_cache(user["id"])
+    asyncio.create_task(refresh_analytics_cache(user["id"]))
     await reset_session(to)
 
     await send_interactive_buttons(
@@ -1396,8 +1436,10 @@ async def show_subscription_confirmation(to: str, parsed: dict):
 
 async def confirm_subscription(to: str, parsed: dict):
     user = await get_user_by_phone(to)
+    if not user:
+        await send_not_registered(to)
+        return
 
-    # Guard: if session data is missing (e.g. stale session), abort cleanly
     if not parsed.get("service_name") or not parsed.get("amount") or not parsed.get("billing_day"):
         await reset_session(to)
         await send_text_message(
