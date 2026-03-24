@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: whatsapp-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: WHATSAPP_TOKEN
+        sync: false
+      - key: PHONE_NUMBER_ID
+        sync: false
+      - key: VERIFY_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: WHATSAPP_APP_SECRET
+        sync: false
+      - key: DASHBOARD_URL
+        sync: false

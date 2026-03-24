@@ -39,6 +39,11 @@ async def shutdown():
 async def health_check():
     return {"status": "ok"}
 
+# ── Ping endpoint ──────────────────────────────────────────────────────────────
+
+@app.get("/ping")
+async def ping():
+    return {"pong": True}
 
 # ── Webhook verification ──────────────────────────────────────────────────────
 
