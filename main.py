@@ -39,9 +39,16 @@ async def shutdown():
 async def health_check():
     return {"status": "ok"}
 
+@app.get("/")
+async def home():
+    return {
+        "service": "WhatsApp Bot",
+        "status": "running"
+    }
+
 # ── Ping endpoint ──────────────────────────────────────────────────────────────
 
-@app.get("/ping")
+@app.api_route("/ping", methods=["GET", "HEAD"])
 async def ping():
     return {"pong": True}
 
