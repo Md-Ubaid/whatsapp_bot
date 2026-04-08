@@ -1,11 +1,16 @@
 # Finance Tracker by Shyara — Database Helper Functions
 # ─────────────────────────────────────────────────────────────────────────────
 
-from database import database
+import logging
+
+from app.core.database import database
 from datetime import datetime, timedelta, timezone
 import json
 
 __all__ = ["database"]
+
+logger = logging.getLogger(__name__)
+_table_exists_cache: dict[str, bool] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -22,13 +27,6 @@ ACCOUNT_TYPE_LABELS = {
     "wallet":       "Wallet",
     "upi":          "UPI",
     "cash":         "Cash in Hand",
-}
-
-CATEGORY_EMOJI = {
-    "bank":    "🏦",
-    "card":    "💳",
-    "digital": "📱",
-    "cash":    "💵",
 }
 
 # Single source of truth for payment method labels.
@@ -69,32 +67,6 @@ async def get_user_by_phone(phone: str):
     )
 
 
-async def get_user_by_id(user_id: int):
-    return await database.fetch_one(
-        "SELECT * FROM users WHERE id = :uid",
-        {"uid": user_id}
-    )
-
-
-async def create_user(phone: str):
-    return await database.fetch_one(
-        """INSERT INTO users (phone_number)
-           VALUES (:phone)
-           ON CONFLICT (phone_number) DO NOTHING
-           RETURNING *""",
-        {"phone": phone}
-    )
-
-
-async def update_user_name(phone: str, name: str):
-    await database.execute(
-        """UPDATE users
-           SET name = :name, is_registered = TRUE
-           WHERE phone_number = :phone""",
-        {"name": name, "phone": phone}
-    )
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # ACCOUNTS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -112,53 +84,6 @@ async def get_account_by_id(account_id: int):
     return await database.fetch_one(
         "SELECT * FROM accounts WHERE id = :id",
         {"id": account_id}
-    )
-
-
-async def get_default_account(user_id: int):
-    return await database.fetch_one(
-        "SELECT * FROM accounts WHERE user_id = :uid AND is_default = TRUE",
-        {"uid": user_id}
-    )
-
-
-async def create_account(
-    user_id: int,
-    nickname: str,
-    bank_name: str,
-    account_category: str,
-    account_type: str,
-    is_default: bool = False,
-    credit_limit: float = None
-):
-    await database.execute(
-        """INSERT INTO accounts
-           (user_id, nickname, bank_name, account_category,
-            account_type, is_default, credit_limit)
-           VALUES (:uid, :nick, :bank, :cat, :atype, :is_def, :climit)""",
-        {
-            "uid":    user_id,
-            "nick":   nickname,
-            "bank":   bank_name,
-            "cat":    account_category,
-            "atype":  account_type,
-            "is_def": is_default,
-            "climit": credit_limit,
-        }
-    )
-
-
-async def update_account_balance(account_id: int, new_balance: float):
-    await database.execute(
-        "UPDATE accounts SET balance = :bal WHERE id = :id",
-        {"bal": new_balance, "id": account_id}
-    )
-
-
-async def update_account_outstanding(account_id: int, new_outstanding: float):
-    await database.execute(
-        "UPDATE accounts SET outstanding = :out WHERE id = :id",
-        {"out": new_outstanding, "id": account_id}
     )
 
 
@@ -212,7 +137,7 @@ async def get_accounts_for_picker(user_id: int):
 # TRANSACTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def insert_transaction(
+async def record_transaction_with_account_update(
     user_id: int,
     account_id: int,
     amount: float,
@@ -223,63 +148,74 @@ async def insert_transaction(
     is_essential: bool = True,
     to_account_id: int = None,
     subscription_id: int = None,
-    payment_method: str = None
+    payment_method: str = None,
 ):
-    return await database.fetch_one(
-        """INSERT INTO transactions
-           (user_id, account_id, amount, type, category,
-            sub_category, merchant, is_essential,
-            to_account_id, subscription_id, payment_method)
-           VALUES
-           (:uid, :aid, :amt, :type, :cat,
-            :subcat, :merch, :ess,
-            :to_aid, :sub_id, :pm)
-           RETURNING id""",
-        {
-            "uid":    user_id,
-            "aid":    account_id,
-            "amt":    amount,
-            "type":   type_,
-            "cat":    category,
-            "subcat": sub_category,
-            "merch":  merchant,
-            "ess":    is_essential,
-            "to_aid": to_account_id,
-            "sub_id": subscription_id,
-            "pm":     payment_method,
-        }
-    )
+    async with database.connection() as connection:
+        async with connection.transaction():
+            account = None
+            if account_id:
+                account = await connection.fetch_one(
+                    """SELECT id, user_id, account_type, balance, outstanding
+                       FROM accounts
+                       WHERE id = :id
+                       FOR UPDATE""",
+                    {"id": account_id}
+                )
+                if not account:
+                    raise ValueError("Selected account was not found.")
+                if account["user_id"] != user_id:
+                    raise ValueError("Selected account does not belong to this user.")
 
+            transaction_row = await connection.fetch_one(
+                """INSERT INTO transactions
+                   (user_id, account_id, amount, type, category,
+                    sub_category, merchant, is_essential,
+                    to_account_id, subscription_id, payment_method)
+                   VALUES
+                   (:uid, :aid, :amt, :type, :cat,
+                    :subcat, :merch, :ess,
+                    :to_aid, :sub_id, :pm)
+                   RETURNING id""",
+                {
+                    "uid":    user_id,
+                    "aid":    account_id,
+                    "amt":    amount,
+                    "type":   type_,
+                    "cat":    category,
+                    "subcat": sub_category,
+                    "merch":  merchant,
+                    "ess":    is_essential,
+                    "to_aid": to_account_id,
+                    "sub_id": subscription_id,
+                    "pm":     payment_method,
+                }
+            )
 
-async def get_recent_transactions(user_id: int, limit: int = 10):
-    return await database.fetch_all(
-        """SELECT t.*, a.nickname AS account_name
-           FROM transactions t
-           LEFT JOIN accounts a ON t.account_id = a.id
-           WHERE t.user_id = :uid
-           ORDER BY t.transaction_date DESC
-           LIMIT :lim""",
-        {"uid": user_id, "lim": limit}
-    )
+            if account:
+                if type_ == "income":
+                    await connection.execute(
+                        """UPDATE accounts
+                           SET balance = COALESCE(balance, 0) + :amt
+                           WHERE id = :id""",
+                        {"amt": amount, "id": account_id}
+                    )
+                elif type_ == "expense":
+                    if account["account_type"] == "credit_card":
+                        await connection.execute(
+                            """UPDATE accounts
+                               SET outstanding = COALESCE(outstanding, 0) + :amt
+                               WHERE id = :id""",
+                            {"amt": amount, "id": account_id}
+                        )
+                    else:
+                        await connection.execute(
+                            """UPDATE accounts
+                               SET balance = COALESCE(balance, 0) - :amt
+                               WHERE id = :id""",
+                            {"amt": amount, "id": account_id}
+                        )
 
-
-async def get_last_transaction(user_id: int):
-    return await database.fetch_one(
-        """SELECT t.*, a.nickname AS account_name
-           FROM transactions t
-           LEFT JOIN accounts a ON t.account_id = a.id
-           WHERE t.user_id = :uid
-           ORDER BY t.transaction_date DESC
-           LIMIT 1""",
-        {"uid": user_id}
-    )
-
-
-async def delete_transaction(transaction_id: int):
-    await database.execute(
-        "DELETE FROM transactions WHERE id = :id",
-        {"id": transaction_id}
-    )
+            return transaction_row
 
 
 async def get_monthly_expense_total(user_id: int, month_year: str) -> float:
@@ -291,33 +227,6 @@ async def get_monthly_expense_total(user_id: int, month_year: str) -> float:
         {"uid": user_id, "my": month_year}
     )
     return float(val or 0)
-
-
-async def get_monthly_income_total(user_id: int, month_year: str) -> float:
-    val = await database.fetch_val(
-        """SELECT COALESCE(SUM(amount), 0) FROM transactions
-           WHERE user_id = :uid
-             AND type = 'income'
-             AND TO_CHAR(transaction_date, 'YYYY-MM') = :my""",
-        {"uid": user_id, "my": month_year}
-    )
-    return float(val or 0)
-
-
-async def get_category_totals(user_id: int, month_year: str):
-    return await database.fetch_all(
-        """SELECT category,
-                  COUNT(*) AS txn_count,
-                  SUM(amount) AS total
-           FROM transactions
-           WHERE user_id = :uid
-             AND type = 'expense'
-             AND TO_CHAR(transaction_date, 'YYYY-MM') = :my
-             AND category IS NOT NULL
-           GROUP BY category
-           ORDER BY total DESC""",
-        {"uid": user_id, "my": month_year}
-    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -393,68 +302,110 @@ async def get_subscriptions(user_id: int):
     )
 
 
-async def find_subscription_by_merchant(user_id: int, merchant: str):
-    return await database.fetch_one(
-        """SELECT * FROM subscriptions
+async def get_goals(user_id: int):
+    return await database.fetch_all(
+        """SELECT *
+           FROM goals
            WHERE user_id = :uid
-             AND status = 'active'
-             AND LOWER(service_name) = LOWER(:merchant)""",
-        {"uid": user_id, "merchant": merchant}
-    )
-
-
-async def get_subscription_monthly_total(user_id: int) -> float:
-    val = await database.fetch_val(
-        """SELECT COALESCE(SUM(amount), 0) FROM subscriptions
-           WHERE user_id = :uid AND status = 'active'""",
+           ORDER BY
+             CASE priority
+               WHEN 'high' THEN 1
+               WHEN 'medium' THEN 2
+               WHEN 'low' THEN 3
+               ELSE 4
+             END,
+             created_at ASC""",
         {"uid": user_id}
     )
-    return float(val or 0)
+
+
+async def get_goal_by_id(goal_id: int):
+    return await database.fetch_one(
+        "SELECT * FROM goals WHERE id = :id",
+        {"id": goal_id}
+    )
+
+
+async def create_goal(
+    user_id: int,
+    name: str,
+    target_amount: float,
+    current_amount: float = 0,
+    icon: str = "🎯",
+    theme: str = "emerald",
+    priority: str = "medium"
+):
+    return await database.fetch_one(
+        """INSERT INTO goals
+           (user_id, name, icon, target_amount, current_amount, theme, priority)
+           VALUES (:uid, :name, :icon, :target, :current, :theme, :priority)
+           RETURNING id""",
+        {
+            "uid": user_id,
+            "name": name,
+            "icon": icon,
+            "target": target_amount,
+            "current": current_amount,
+            "theme": theme,
+            "priority": priority,
+        }
+    )
+
+
+async def update_goal_current_amount(goal_id: int, new_amount: float):
+    await database.execute(
+        "UPDATE goals SET current_amount = :amount WHERE id = :id",
+        {"amount": new_amount, "id": goal_id}
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BUDGETS
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def get_budget_for_category(user_id: int, category: str, month_year: str):
-    return await database.fetch_one(
-        """SELECT * FROM budgets
-           WHERE user_id = :uid
-             AND category = :cat
-             AND month_year = :my""",
-        {"uid": user_id, "cat": category, "my": month_year}
-    )
-
-
-async def get_all_budgets(user_id: int, month_year: str):
-    return await database.fetch_all(
-        """SELECT * FROM budgets
-           WHERE user_id = :uid AND month_year = :my
-           ORDER BY monthly_limit DESC""",
-        {"uid": user_id, "my": month_year}
-    )
-
-
 async def get_total_budget(user_id: int, month_year: str) -> float:
-    val = await database.fetch_val(
-        """SELECT COALESCE(SUM(monthly_limit), 0)
-           FROM budgets
-           WHERE user_id = :uid AND month_year = :my""",
-        {"uid": user_id, "my": month_year}
+    if await _table_exists("budgets"):
+        val = await database.fetch_val(
+            """SELECT COALESCE(SUM(monthly_limit), 0)
+               FROM budgets
+               WHERE user_id = :uid AND month_year = :my""",
+            {"uid": user_id, "my": month_year}
+        )
+        return float(val or 0)
+
+    if await _table_exists("budget_configurations"):
+        val = await database.fetch_val(
+            """SELECT COALESCE(SUM(monthly_limit), 0)
+               FROM budget_configurations
+               WHERE user_id = :uid""",
+            {"uid": user_id}
+        )
+        return float(val or 0)
+
+    return 0.0
+
+
+async def _table_exists(table_name: str) -> bool:
+    cached = _table_exists_cache.get(table_name)
+    if cached is not None:
+        return cached
+
+    exists = await database.fetch_val(
+        """SELECT EXISTS (
+               SELECT 1
+               FROM information_schema.tables
+               WHERE table_schema = 'public'
+                 AND table_name = :table_name
+           )""",
+        {"table_name": table_name}
     )
-    return float(val or 0)
+    _table_exists_cache[table_name] = bool(exists)
+    return bool(exists)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ANALYTICS CACHE
 # ══════════════════════════════════════════════════════════════════════════════
-
-async def get_analytics_cache(user_id: int):
-    return await database.fetch_one(
-        "SELECT * FROM analytics_cache WHERE user_id = :uid",
-        {"uid": user_id}
-    )
-
 
 async def refresh_analytics_cache(user_id: int):
     month_year = datetime.now(timezone.utc).strftime("%Y-%m")
@@ -469,9 +420,13 @@ async def refresh_analytics_cache(user_id: int):
     )
     balance = float(balance_row["total"] or 0) if balance_row else 0.0
 
-    spent        = await get_monthly_expense_total(user_id, month_year)
-    budget_total = await get_total_budget(user_id, month_year)
-    pct          = int((spent / budget_total * 100)) if budget_total > 0 else 0
+    spent = await get_monthly_expense_total(user_id, month_year)
+    try:
+        budget_total = await get_total_budget(user_id, month_year)
+    except Exception as e:
+        logger.warning(f"Budget total refresh failed for user {user_id}: {e}")
+        budget_total = 0
+    pct = int((spent / budget_total * 100)) if budget_total > 0 else 0
 
     next_sub = await database.fetch_one(
         """SELECT s.service_name, s.amount, s.billing_day,

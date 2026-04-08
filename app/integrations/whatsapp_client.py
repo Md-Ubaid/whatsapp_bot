@@ -6,7 +6,10 @@
 
 import httpx
 import logging
-from config import WHATSAPP_TOKEN, WHATSAPP_API_URL
+import re
+import unicodedata
+
+from app.core.config import WHATSAPP_TOKEN, WHATSAPP_API_URL
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +63,25 @@ async def _post(payload: dict) -> dict:
     except Exception as e:
         logger.error(f"Unexpected error sending WhatsApp message: {e}")
         return {}
+
+
+def _clean_menu_label(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    cleaned = []
+    started = False
+    for char in text:
+        category = unicodedata.category(char)
+        if not started and (category.startswith("S") or category.startswith("P") or char.isspace()):
+            continue
+        started = True
+        cleaned.append(char)
+
+    normalized = "".join(cleaned).strip() or text
+    normalized = re.sub(r"\s{2,}", " ", normalized)
+    return normalized
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -127,7 +149,7 @@ async def send_interactive_buttons(
             "type":  "reply",
             "reply": {
                 "id":    str(btn["id"])[:256],
-                "title": str(btn["title"])[:MAX_BUTTON_TITLE]
+                "title": _clean_menu_label(btn["title"])[:MAX_BUTTON_TITLE]
             }
         })
 
@@ -204,17 +226,17 @@ async def send_list_message(
 
             safe_row = {
                 "id":    str(row["id"])[:256],
-                "title": str(row["title"])[:MAX_ROW_TITLE],
+                "title": _clean_menu_label(row["title"])[:MAX_ROW_TITLE],
             }
             if row.get("description"):
-                safe_row["description"] = str(row["description"])[:MAX_ROW_DESC]
+                safe_row["description"] = _clean_menu_label(row["description"])[:MAX_ROW_DESC]
 
             safe_rows.append(safe_row)
             total_rows += 1
 
         if safe_rows:
             safe_sections.append({
-                "title": str(section.get("title", "Options"))[:24],
+                "title": _clean_menu_label(section.get("title", "Options"))[:24],
                 "rows":  safe_rows
             })
 
@@ -230,7 +252,7 @@ async def send_list_message(
             "type": "list",
             "body": {"text": body_text[:1024]},
             "action": {
-                "button":   button_label[:MAX_BUTTON_LABEL],
+                "button":   _clean_menu_label(button_label)[:MAX_BUTTON_LABEL],
                 "sections": safe_sections
             }
         }

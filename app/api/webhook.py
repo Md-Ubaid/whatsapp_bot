@@ -4,10 +4,11 @@ import hmac
 import hashlib
 
 from fastapi import FastAPI, Request, Query, HTTPException, BackgroundTasks
-from database import database
-from config import VERIFY_TOKEN, WHATSAPP_APP_SECRET
-from db_helpers import is_user_registered, get_session
-from bot_logic import (
+
+from app.core.database import database
+from app.core.config import VERIFY_TOKEN, WHATSAPP_APP_SECRET
+from app.repositories.db_helpers import is_user_registered, get_session
+from app.services.chatbot_flow import (
     send_main_menu,
     handle_button_click,
     handle_list_selection,
@@ -55,6 +56,7 @@ async def ping():
 # ── Webhook verification ──────────────────────────────────────────────────────
 
 @app.get("/webhook")
+@app.get("/webhooks/whatsapp")
 async def verify_webhook(
     hub_mode: str = Query(None, alias="hub.mode"),
     hub_challenge: str = Query(None, alias="hub.challenge"),
@@ -187,6 +189,7 @@ async def _process_message(body: dict):
 # ── Webhook receiver ──────────────────────────────────────────────────────────
 
 @app.post("/webhook")
+@app.post("/webhooks/whatsapp")
 async def receive_message(request: Request, background_tasks: BackgroundTasks):
     """
     Receives incoming WhatsApp webhook POST.
