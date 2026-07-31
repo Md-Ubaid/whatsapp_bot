@@ -174,7 +174,7 @@ async def get_due_subscriptions(user_id: int) -> list:
     subs = await database.fetch_all(
         """SELECT s.id, s.service_name, s.amount, s.billing_day,
                   COALESCE(a.nickname, 'No Account') AS account_name
-           FROM subscriptions s
+           FROM recurring_payments s
            LEFT JOIN accounts a ON s.account_id = a.id
            WHERE s.user_id = :uid AND s.status = 'active'
            ORDER BY s.billing_day""",
@@ -586,7 +586,7 @@ async def handle_list_selection(to: str, row_id: str, session):
         sub_id = int(row_id.replace("sub_pay_", ""))
         sub = await database.fetch_one(
             """SELECT s.*
-               FROM subscriptions s
+               FROM recurring_payments s
                WHERE s.id = :id""",
             {"id": sub_id}
         )
@@ -1213,7 +1213,7 @@ async def send_monthly_summary(to: str):
         {"uid": uid, "m": month}
     ) or 0)
     subs = float(await database.fetch_val(
-        "SELECT COALESCE(SUM(amount),0) FROM subscriptions WHERE user_id=:uid AND status='active'",
+        "SELECT COALESCE(SUM(amount),0) FROM recurring_payments WHERE user_id=:uid AND status='active'",
         {"uid": uid}
     ) or 0)
 
@@ -1597,7 +1597,7 @@ async def confirm_subscription(to: str, parsed: dict):
         return
 
     await database.execute(
-        """INSERT INTO subscriptions
+        """INSERT INTO recurring_payments
            (user_id, account_id, service_name, category, amount, billing_day, status)
            VALUES (:uid, :aid, :name, :category, :amt, :day, 'active')""",
         {

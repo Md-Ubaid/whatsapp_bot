@@ -62,9 +62,9 @@ CREATE UNIQUE INDEX one_default_per_user
 CREATE INDEX idx_accounts_user    ON accounts(user_id);
 CREATE INDEX idx_accounts_default ON accounts(user_id, is_default);
 
--- ── 3. SUBSCRIPTIONS ────────────────────────────────────────────────────────
+-- ── 3. RECURRING PAYMENTS ───────────────────────────────────────────────────
 -- Created before transactions because transactions references it
-CREATE TABLE subscriptions (
+CREATE TABLE recurring_payments (
     id                  SERIAL PRIMARY KEY,
     user_id             INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     account_id          INTEGER REFERENCES accounts(id),
@@ -94,7 +94,7 @@ CREATE TABLE transactions (
     notes               TEXT,
     transaction_date    TIMESTAMPTZ DEFAULT NOW(),
     to_account_id       INTEGER REFERENCES accounts(id),
-    subscription_id     INTEGER REFERENCES subscriptions(id),
+    subscription_id     INTEGER REFERENCES recurring_payments(id),
     created_at          TIMESTAMPTZ DEFAULT NOW()
 );
 
