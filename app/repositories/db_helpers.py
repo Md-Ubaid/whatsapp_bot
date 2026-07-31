@@ -293,11 +293,13 @@ async def reset_session(phone: str):
 
 async def get_subscriptions(user_id: int):
     return await database.fetch_all(
-        """SELECT s.*, a.nickname AS account_name
-           FROM subscriptions s
+        """SELECT s.id, s.merchant AS service_name, s.amount, 
+                  COALESCE(EXTRACT(DAY FROM s.next_expected::date)::integer, 1) AS billing_day, 
+                  s.category, s.status, s.account_id, a.nickname AS account_name
+           FROM recurring_payments s
            LEFT JOIN accounts a ON s.account_id = a.id
-           WHERE s.user_id = :uid AND s.status = 'active'
-           ORDER BY s.billing_day""",
+           WHERE s.user_id = :uid AND s.status IN ('active', 'confirmed')
+           ORDER BY billing_day""",
         {"uid": user_id}
     )
 
@@ -429,12 +431,13 @@ async def refresh_analytics_cache(user_id: int):
     pct = int((spent / budget_total * 100)) if budget_total > 0 else 0
 
     next_sub = await database.fetch_one(
-        """SELECT s.service_name, s.amount, s.billing_day,
+        """SELECT s.merchant AS service_name, s.amount, 
+                  COALESCE(EXTRACT(DAY FROM s.next_expected::date)::integer, 1) AS billing_day,
                   COALESCE(a.nickname, 'No Account') AS acc_name
-           FROM subscriptions s
+           FROM recurring_payments s
            LEFT JOIN accounts a ON s.account_id = a.id
-           WHERE s.user_id = :uid AND s.status = 'active'
-           ORDER BY s.billing_day ASC
+           WHERE s.user_id = :uid AND s.status IN ('active', 'confirmed')
+           ORDER BY billing_day ASC
            LIMIT 1""",
         {"uid": user_id}
     )
