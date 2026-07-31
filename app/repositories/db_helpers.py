@@ -293,8 +293,12 @@ async def reset_session(phone: str):
 
 async def get_subscriptions(user_id: int):
     return await database.fetch_all(
+<<<<<<< HEAD
+        """SELECT s.id, s.merchant AS service_name, s.amount, s.billing_day, s.category, s.status, s.account_id, a.nickname AS account_name
+=======
         """SELECT s.*, a.nickname AS account_name
-           FROM subscriptions s
+>>>>>>> 71b0709e61386b0bb172347d5968c3caa9157af9
+           FROM recurring_payments s
            LEFT JOIN accounts a ON s.account_id = a.id
            WHERE s.user_id = :uid AND s.status = 'active'
            ORDER BY s.billing_day""",
@@ -429,9 +433,9 @@ async def refresh_analytics_cache(user_id: int):
     pct = int((spent / budget_total * 100)) if budget_total > 0 else 0
 
     next_sub = await database.fetch_one(
-        """SELECT s.service_name, s.amount, s.billing_day,
+        """SELECT s.merchant AS service_name, s.amount, s.billing_day,
                   COALESCE(a.nickname, 'No Account') AS acc_name
-           FROM subscriptions s
+           FROM recurring_payments s
            LEFT JOIN accounts a ON s.account_id = a.id
            WHERE s.user_id = :uid AND s.status = 'active'
            ORDER BY s.billing_day ASC
